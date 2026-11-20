@@ -66,7 +66,7 @@ export function createApp(): Server {
     } catch (err) {
       // A handler crash must never take the server down: answer a JSON error and stay up.
       if (!res.headersSent) {
-        sendJson(res, 500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
+        sendJson(res, 500, { message: err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : 'Internal Server Error' });
       } else {
         try { res.end(); } catch { /* the socket is already gone */ }
       }

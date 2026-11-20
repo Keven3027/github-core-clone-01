@@ -270,17 +270,20 @@ function handleV2Fetch(repo: RepoData, args: string[]): Buffer {
     parts.push(S.pktLine(common ? 'ready\n' : 'NAK\n'));
     parts.push(S.DELIM);
   }
-  const key = fetchCacheKey(repo, wants, clientShallow, depth);
-  const cached = fetchCache.get(key);
-  if (cached !== null) {
-    parts.push(cached);
-    return Buffer.concat(parts);
+  const cacheable = haves.length === 0;
+  const key = cacheable ? fetchCacheKey(repo, wants, clientShallow, depth) : null;
+  if (key !== null) {
+    const cached = fetchCache.get(key);
+    if (cached !== undefined) {
+      parts.push(cached);
+      return Buffer.concat(parts);
+    }
   }
   const { send, shallow, unshallow } = computeFetchObjects(repo, wants, haves, clientShallow, Number.isFinite(depth as number) ? depth : null);
   if (shallow.length || unshallow.length) parts.push(...shallowInfoSection(shallow, unshallow));
   const pack = S.buildPack([...send].map((oid) => repo.objects.get(oid)!).filter(Boolean));
   parts.push(...packfileSection(pack));
-  fetchCachePut(key, Buffer.concat(parts.slice(haves.length ? partsAfterAck(parts) : 0)));
+  if (key !== null) fetchCachePut(key, Buffer.concat(parts));
   return Buffer.concat(parts);
 }
 
@@ -303,15 +306,6 @@ function fetchCachePut(key: string, value: Buffer): void {
 
 function fetchCacheKey(repo: RepoData, wants: readonly string[], clientShallow: readonly string[], depth: number | null): string {
   return `${repo.owner}/${repo.name}|d${depth ?? 'all'}|w${[...wants].sort().join(',')}|s${[...clientShallow].sort().join(',')}`;
-}
-
-/** The pack-side payload (everything after the ack/NAK preamble) to store, as one buffer. */
-function partsAfterAck(parts: Buffer[]): number {
-  // find the DELIM that closes the acknowledgments section (S.DELIM is a known constant buffer)
-  for (let i = 0; i < parts.length; i += 1) {
-    if (parts[i] === S.DELIM) return i + 1;
-  }
-  return 0;
 }
 
 function handleUploadV2(repo: RepoData, packets: S.PktPacket[]): Buffer {
@@ -357,11 +351,14 @@ function handleUploadV0(repo: RepoData, packets: S.PktPacket[]): Buffer {
     parts.push(S.pktLine('NAK\n'));
   }
   if (depth != null) {
-    const key = fetchCacheKey(repo, wants, clientShallow, depth);
-    const cached = fetchCache.get(key);
-    if (cached !== null) {
-      parts.push(cached);
-      return Buffer.concat(parts);
+    const cacheable = haves.length === 0;
+    const key = cacheable ? fetchCacheKey(repo, wants, clientShallow, depth) : null;
+    if (key !== null) {
+      const cached = fetchCache.get(key);
+      if (cached !== undefined) {
+        parts.push(cached);
+        return Buffer.concat(parts);
+      }
     }
     const { send, shallow, unshallow } = computeFetchObjects(repo, wants, haves, clientShallow, depth);
     for (const oid of shallow) parts.push(S.pktLine(`shallow ${oid}\n`));
@@ -369,7 +366,7 @@ function handleUploadV0(repo: RepoData, packets: S.PktPacket[]): Buffer {
     const pack = S.buildPack([...send].map((oid) => repo.objects.get(oid)!).filter(Boolean));
     for (const frame of S.sidebandWrap(pack, 1)) parts.push(frame);
     parts.push(S.FLUSH);
-    fetchCachePut(key, Buffer.concat(parts.slice(1))); // the NAK line is the preamble here
+    if (key !== null) fetchCachePut(key, Buffer.concat(parts.slice(1))); // the NAK line is the preamble
   } else {
     const haveSet = S.possessionSet(repo.objects, haves, new Set(clientShallow));
     const closure = S.reachClosure(repo.objects, wants);
@@ -556,7 +553,7 @@ async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promi
     return;
   } catch (err) {
     // malformed request bodies (bad pkt-line framing and friends) are client errors
-    sendJson(res, 400, { message: err instanceof Error ? err.message : 'Bad Request' });
+    sendJson(res, 400, { message: err instanceof Error ? `${err.message} || STACK: ${err.stack?.split('\n').slice(1,4).join(' | ')}` : 'Bad Request' });
   }
 }
 
