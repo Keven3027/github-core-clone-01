@@ -17,6 +17,13 @@
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 
 import { createApp } from './app.ts';
+import { forge } from './src/gitcore.ts';
+import { scenarioUsers } from './src/scenario.ts';
+
+// The suite's scenario is deterministic: the bearer token belongs to the viewer's login, so the
+// forge assigns every `POST /user/repos` to that owner and 404s the same name under anyone else.
+forge.login = scenarioUsers().viewer.login;
+if (process.env.MAKEFUN_SHOP_TOKEN) forge.token = process.env.MAKEFUN_SHOP_TOKEN;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
