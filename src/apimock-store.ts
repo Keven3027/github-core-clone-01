@@ -62,7 +62,7 @@ export interface DiffFile {
 
 export interface DirEntry { type: 'file' | 'dir'; name: string; path: string; sha: string; size: number }
 
-function headRef(branch: string): string {
+export function headRef(branch: string): string {
   return `refs/heads/${branch}`;
 }
 
@@ -284,6 +284,10 @@ export function createIssue(repo: RepoData, input: { title: string; body?: strin
   repo.issues.push(issue);
   repo.updatedAt = now;
   return issue;
+}
+
+export function findIssue(repo: RepoData, number: number): Issue | undefined {
+  return repo.issues.find((issue) => issue.number === number);
 }
 
 export function setIssueClosed(issue: Issue, closed: boolean): void {
