@@ -472,7 +472,8 @@ export function commitJson(info: CommitInfo): Json {
     sha: info.sha,
     node_id: `Commit:${info.sha}`,
     commit: {
-      message: info.message,
+      // GitHub serves commit messages without the trailing newline git objects store.
+      message: info.message.replace(/\n+$/, ''),
       author: { name: info.author.name, email: info.author.email, date: info.author.when },
       committer: { name: info.author.name, email: info.author.email, date: info.author.when },
       tree: { sha: treeSha },
