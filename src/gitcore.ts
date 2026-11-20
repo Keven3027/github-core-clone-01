@@ -28,6 +28,8 @@ export class Forge {
   /** The bearer token requests must present; defaults to the MAKEFUN_SHOP_TOKEN env var. */
   token: string = '';
 
+  private nextRepoId = 1;
+
   constructor() {
     this.login = process.env.MAKEFUN_SHOP_LOGIN ?? process.env.MAKEFUN_SHOP_USER ?? '';
     this.token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -57,6 +59,10 @@ export class Forge {
       issues: [],
       pulls: [],
       labels: [],
+      id: this.nextRepoId++,
+      nextNumber: 1,
+      nextCommentId: 1,
+      comments: new Map(),
     };
     this.repos.set(key, repo);
     return repo;

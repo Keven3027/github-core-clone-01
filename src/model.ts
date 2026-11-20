@@ -41,6 +41,13 @@ export interface RepoData {
   issues: Issue[];
   pulls: Pull[];
   labels: Label[];
+  /** API-side bookkeeping (REST/GraphQL/MCP): the numeric database id and shared issue/pull numbering. */
+  id: number;
+  /** Issues and pulls share GitHub's one numbering space. */
+  nextNumber: number;
+  nextCommentId: number;
+  /** Issue comments, keyed by issue number. */
+  comments: Map<number, Comment[]>;
 }
 
 export interface Issue {
@@ -68,6 +75,20 @@ export interface Pull {
   createdAt: string;
   user: string;
   mergeCommitSha: string | null;
+  /** API-side extras: the tips the pull was opened against, and its merge/update bookkeeping. */
+  headSha: string;
+  baseSha: string;
+  mergedAt: string | null;
+  updatedAt: string;
+}
+
+/** One issue comment (REST/GraphQL/MCP surface; the git side never writes these). */
+export interface Comment {
+  id: number;
+  body: string;
+  user: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Label {

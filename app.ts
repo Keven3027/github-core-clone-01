@@ -2,7 +2,8 @@
 // main.ts (the entry <-> env lifecycle) imports createApp from here; the lifecycle stays as the
 // starter shipped it. Handlers: src/git-http.ts, src/rest.ts, src/graphql.ts, src/mcp.ts.
 
-import { createServer, randomUUID, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { isGitRoute, handle as handleGit } from './src/git-http.ts';
 import { handleRest } from './src/rest.ts';
 import { handleGraphQL } from './src/graphql.ts';

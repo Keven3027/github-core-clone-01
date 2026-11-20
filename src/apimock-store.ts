@@ -1,115 +1,31 @@
-// TEMPORARY shared store + git bottom-layer stand-in.
+// apimock-store.ts — the API-side adapter over the REAL git model.
 //
-// TODO(integration): the git agent owns `src/model.ts` + `src/gitcore.ts`. Once model.ts lands, the
-// orchestrator swaps this file out (rest.ts / graphql.ts / mcp.ts / selftest-api.ts import their shared
-// symbols only from here, so a re-export shim or an import-path change is enough). The interfaces used by
-// the API layers are:
-//   - `forge` (the Forge singleton, SPEC.md's shared data model)
-//   - the gitOps-style functions below: branchTip/getFile/listDir/listCommits/createBranch/upsertFile/
-//     deleteFile/squashMerge/diffFiles
-//   - the record helpers and the JSON serializers (repoJson/issueJson/pullJson/labelJson/commentJson)
-//     that give every surface the same object shapes.
-//
-// The mock git model keeps, per commit, a whole-tree snapshot (path -> blob). Copy-on-write per commit:
-// cheap at trial scale (hundreds of small commits), and it makes contents reads, directory listings,
-// squash merges and pull diffs trivial. TODO(integration): replace with the real object/ref model.
+// The original stand-in kept per-commit whole-tree snapshots; everything now runs on the shared
+// object/ref model in src/store.ts + src/gitcore.ts (the same store git smart HTTP serves), so a
+// push, a contents edit and a pull merge all see one history. Every export rest.ts / graphql.ts /
+// mcp.ts import keeps its name and signature.
 
 import { createHash } from 'node:crypto';
 import { isoNow } from './http-util.ts';
+import { forge as gitForge, type Forge } from './gitcore.ts';
+import * as S from './store.ts';
+import type { Comment, Issue, Label, Pull, RepoData } from './model.ts';
+
+export type { Comment, Issue, Label, Pull, RepoData };
+export type ForgeT = Forge;
+/** The one shared store: git smart HTTP, REST, GraphQL and MCP all read and write it. */
+export const forge: Forge = gitForge;
+
+export type ObjType = 'blob' | 'tree' | 'commit' | 'tag';
 
 // ---------------------------------------------------------------------------------------------
-// The shared data model (SPEC.md's skeleton, with mock-only extras clearly marked).
+// Identity + global ids
 // ---------------------------------------------------------------------------------------------
 
-export interface Blob { data: Buffer }
-export interface TreeEntry { mode: string; name: string; sha: string }
-
-export interface Issue {
-  id: string; number: number; title: string; body: string; state: 'open' | 'closed';
-  labels: string[]; createdAt: string; updatedAt: string; closedAt: string | null; user: string;
-}
-
-export interface Pull {
-  id: string; number: number; title: string; body: string; state: 'open' | 'closed';
-  merged: boolean; head: string; base: string; createdAt: string; user: string; mergeCommitSha: string | null;
-  // mock-only extras
-  headSha: string; baseSha: string; mergedAt: string | null; updatedAt: string;
-}
-
-export interface Label { name: string; color: string; description: string | null }
-
-export interface Comment { id: number; body: string; user: string; createdAt: string; updatedAt: string }
-
-/** One mock commit: a whole-tree snapshot plus the commit metadata REST reads back. */
-export interface MockCommit {
-  sha: string; parents: string[]; message: string; when: string;
-  snapshot: Map<string, { sha: string; data: Buffer }>;
-}
-
-export interface RepoData {
-  owner: string; name: string; description: string | null;
-  defaultBranch: string; private: boolean;
-  createdAt: string; updatedAt: string; pushedAt: string;
-  refs: Map<string, string>;                                        // 'refs/heads/main' -> commit sha
-  objects: Map<string, { type: 'blob' | 'tree' | 'commit'; data: Buffer }>;
-  issues: Issue[]; pulls: Pull[]; labels: Label[];
-  // ---- mock-only extras (TODO(integration): the real model/gitcore provides these) ----
-  id: number;                                                       // the numeric database id
-  nextNumber: number;                                               // issues and pulls share GitHub's numbering
-  nextCommentId: number;
-  comments: Map<number, Comment[]>;                                 // issue number -> comments
-  commits: Map<string, MockCommit>;                                 // mock commit store
-}
-
-export class Forge {
-  repos: Map<string, RepoData> = new Map();
-  login = '';
-
-  private nextRepoId = 1;
-
-  createRepo(owner: string, name: string, description: string | null = null): RepoData {
-    const now = isoNow();
-    const repo: RepoData = {
-      owner, name, description,
-      defaultBranch: 'main', private: true,
-      createdAt: now, updatedAt: now, pushedAt: now,
-      refs: new Map(),
-      objects: new Map(),
-      issues: [], pulls: [], labels: [],
-      id: this.nextRepoId++,
-      nextNumber: 1, nextCommentId: 1,
-      comments: new Map(),
-      commits: new Map(),
-    };
-    this.repos.set(`${owner}/${name}`, repo);
-    return repo;
-  }
-
-  getRepo(owner: string, name: string): RepoData | undefined {
-    return this.repos.get(`${owner}/${name}`);
-  }
-
-  deleteRepo(owner: string, name: string): void {
-    this.repos.delete(`${owner}/${name}`);
-  }
-
-  repoByDatabaseId(id: number): RepoData | undefined {
-    for (const repo of this.repos.values()) if (repo.id === id) return repo;
-    return undefined;
-  }
-}
-
-/** The global singleton every surface shares. */
-export const forge = new Forge();
-
-/** The login the bearer token names (main.ts injects Forge.login; a fallback keeps selftests simple). */
+/** The login the bearer token names (main.ts injects Forge.login from the deterministic scenario). */
 export function ownerLogin(): string {
-  return forge.login !== '' ? forge.login : (process.env.MAKEFUN_SHOP_TOKEN ?? 'MAKEFUN_SHOP_TOKEN');
+  return forge.login;
 }
-
-// ---------------------------------------------------------------------------------------------
-// Global ids (the REST node_id and the GraphQL id are the same opaque string).
-// ---------------------------------------------------------------------------------------------
 
 export function gidOf(kind: string, ...parts: Array<string | number>): string {
   return Buffer.from([kind, ...parts].map(String).join(':'), 'utf8').toString('base64');
@@ -125,12 +41,17 @@ export function decodeGid(id: string): string[] | null {
   }
 }
 
+export function repoByDatabaseId(id: number): RepoData | undefined {
+  for (const repo of forge.repos.values()) if (repo.id === id) return repo;
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------------------------
-// gitOps-style bottom layer (TODO(integration): backed by the real gitcore).
+// git bottom layer (real objects, one store with git smart HTTP)
 // ---------------------------------------------------------------------------------------------
 
 export interface CommitInfo {
-  sha: string; parents: string[]; message: string; when: string;
+  sha: string; tree?: string; parents: string[]; message: string; when: string;
   author: { name: string; email: string; when: string };
 }
 
@@ -150,43 +71,37 @@ export function branchTip(repo: RepoData, branch: string): string | null {
   return repo.refs.get(headRef(branch)) ?? null;
 }
 
-function snapshotOf(repo: RepoData, branch: string): Map<string, { sha: string; data: Buffer }> | null {
+function tipTree(repo: RepoData, branch: string): string | null {
   const tip = branchTip(repo, branch);
   if (tip === null) return null;
-  return repo.commits.get(tip)?.snapshot ?? null;
+  const obj = repo.objects.get(tip);
+  if (obj === undefined || obj.type !== 'commit') return null;
+  return S.parseCommitObj(obj.data).tree;
 }
 
-function gitBlobSha(data: Buffer): string {
-  const hash = createHash('sha1');
-  hash.update(`blob ${data.length}\u0000`);
-  hash.update(data);
-  return hash.digest('hex');
-}
-
-function createCommit(repo: RepoData, snapshot: Map<string, { sha: string; data: Buffer }>, parents: string[], message: string): string {
-  const when = isoNow();
-  const key = [...snapshot.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([path, blob]) => `${path}\u0000${blob.sha}`).join('\n');
-  const sha = createHash('sha1').update(`commit\u0000${key}\u0000${parents.join(',')}\u0000${message}\u0000${when}\u0000${repo.commits.size}`).digest('hex');
-  repo.commits.set(sha, { sha, parents, message, when, snapshot });
-  repo.objects.set(sha, { type: 'commit', data: Buffer.from(`${key}\n${message}`) });
-  repo.updatedAt = when;
-  repo.pushedAt = when;
-  return sha;
+function blobData(repo: RepoData, sha: string): Buffer {
+  return repo.objects.get(sha)?.data ?? Buffer.alloc(0);
 }
 
 /** One file's blob on a branch, or null. */
 export function getFile(repo: RepoData, branch: string, path: string): { sha: string; data: Buffer } | null {
-  return snapshotOf(repo, branch)?.get(path) ?? null;
+  const tree = tipTree(repo, branch);
+  if (tree === null) return null;
+  const ent = S.treeGet(repo.objects, tree, path);
+  if (ent === null) return null;
+  if (ent.mode === '40000' || ent.mode === '040000') return null; // a tree is not a file
+  return { sha: ent.sha, data: blobData(repo, ent.sha) };
 }
 
 /** The immediate children of a directory on a branch, or null when the directory does not exist. */
 export function listDir(repo: RepoData, branch: string, dir: string): DirEntry[] | null {
-  const snapshot = snapshotOf(repo, branch);
-  if (snapshot === null) return dir === '' ? [] : null;
+  const tree = tipTree(repo, branch);
+  if (tree === null) return dir === '' ? [] : null;
+  const flat = S.flattenTree(repo.objects, tree);
   const prefix = dir === '' ? '' : `${dir}/`;
   let found = false;
   const children = new Map<string, 'file' | 'dir'>();
-  for (const key of snapshot.keys()) {
+  for (const key of flat.keys()) {
     if (!key.startsWith(prefix) || key === prefix) continue;
     found = true;
     const rest = key.slice(prefix.length);
@@ -194,16 +109,23 @@ export function listDir(repo: RepoData, branch: string, dir: string): DirEntry[]
     if (slash === -1) children.set(rest, 'file');
     else children.set(rest.slice(0, slash), 'dir');
   }
-  if (!found && dir !== '') return null;
+  if (!found && dir !== '') {
+    // a directory that only holds deeper paths still exists when the tree has the prefix
+    for (const key of flat.keys()) {
+      if (key.startsWith(prefix)) { found = true; break; }
+    }
+    if (!found) return null;
+  }
   const entries: DirEntry[] = [];
   const names = [...children.keys()].sort();
   for (const name of names) {
     const path = `${prefix}${name}`;
     if (children.get(name) === 'file') {
-      const blob = snapshot.get(path)!;
-      entries.push({ type: 'file', name, path, sha: blob.sha, size: blob.data.length });
+      const ent = flat.get(path)!;
+      entries.push({ type: 'file', name, path, sha: ent.sha, size: blobData(repo, ent.sha).length });
     } else {
-      entries.push({ type: 'dir', name, path, sha: createHash('sha1').update(`tree ${path}`).digest('hex'), size: 0 });
+      const ent = S.treeGet(repo.objects, tree, path);
+      entries.push({ type: 'dir', name, path, sha: ent?.sha ?? createHash('sha1').update(`tree ${path}`).digest('hex'), size: 0 });
     }
   }
   return entries;
@@ -212,41 +134,50 @@ export function listDir(repo: RepoData, branch: string, dir: string): DirEntry[]
 /** The commits of a branch (or of a commit sha), newest first. */
 export function listCommits(repo: RepoData, branchOrSha: string, depth = 200): CommitInfo[] {
   let sha: string | null;
-  if (/^[0-9a-f]{40}$/i.test(branchOrSha) && repo.commits.has(branchOrSha)) sha = branchOrSha;
+  if (S.isObjectId(branchOrSha) && repo.objects.get(branchOrSha.toLowerCase())?.type === 'commit') sha = branchOrSha.toLowerCase();
   else sha = branchTip(repo, branchOrSha);
   const out: CommitInfo[] = [];
   while (sha !== null && out.length < depth) {
-    const commit = repo.commits.get(sha);
-    if (commit === undefined) break;
+    const obj = repo.objects.get(sha);
+    if (obj === undefined || obj.type !== 'commit') break;
+    const parsed = S.parseCommitObj(obj.data);
+    const author = S.parseAuthorLine(parsed.author);
     out.push({
-      sha: commit.sha, parents: commit.parents, message: commit.message, when: commit.when,
-      author: { name: ownerLogin(), email: `${ownerLogin()}@makefun.local`, when: commit.when },
+      sha, tree: parsed.tree, parents: parsed.parents, message: parsed.message, when: author.when,
+      author: { name: author.name, email: author.email, when: author.when },
     });
-    sha = commit.parents[0] ?? null;
+    sha = parsed.parents[0] ?? null;
   }
   return out;
 }
 
-/** Create a branch at `sha`; false when the branch exists or the sha is unknown. */
+/** Create a branch at `sha`; false when the branch exists or the sha is not a known commit. */
 export function createBranch(repo: RepoData, branch: string, sha: string): boolean {
   const ref = headRef(branch);
   if (repo.refs.has(ref)) return false;
-  if (!/^[0-9a-f]{40}$/i.test(sha) || !repo.commits.has(sha)) return false;
-  repo.refs.set(ref, sha.toLowerCase());
+  const oid = sha.toLowerCase();
+  const commit = S.isObjectId(oid) ? S.peelToCommit(repo.objects, oid) : null;
+  if (commit === null) return false;
+  repo.refs.set(ref, commit);
+  repo.updatedAt = isoNow();
   return true;
 }
 
 /** Commit `content` at `path` on `branch` (creating the branch's first commit when it is unborn). */
 export function upsertFile(repo: RepoData, branch: string, path: string, content: Buffer, message: string): { commitSha: string; blobSha: string; oldSha: string | null } {
   const tip = branchTip(repo, branch);
-  const snapshot = tip === null ? new Map() : new Map(repo.commits.get(tip)!.snapshot);
-  const blobSha = gitBlobSha(content);
-  const existing = snapshot.get(path);
-  const oldSha = existing ? existing.sha : null;
-  snapshot.set(path, { sha: blobSha, data: content });
-  repo.objects.set(blobSha, { type: 'blob', data: content });
-  const commitSha = createCommit(repo, snapshot, tip === null ? [] : [tip], message);
+  const baseTree = tip === null ? null : S.parseCommitObj(repo.objects.get(tip)!.data).tree;
+  const existing = S.treeGet(repo.objects, baseTree, path);
+  const oldSha = existing !== null && existing.type !== 'tree' ? existing.sha : null;
+  const blobSha = S.storeObj(repo.objects, 'blob', content);
+  const newTree = S.upsertTreePath(repo.objects, baseTree, path.split('/').filter((s) => s.length > 0), { mode: '100644', sha: blobSha });
+  const who = { name: ownerLogin(), email: `${ownerLogin()}@makefun.local` };
+  const line = S.authorLine(who.name, who.email, Math.floor(Date.now() / 1000));
+  const commitData = S.buildCommitObj(newTree, tip === null ? [] : [tip], line, line, message.endsWith('\n') ? message : `${message}\n`);
+  const commitSha = S.storeObj(repo.objects, 'commit', commitData);
   repo.refs.set(headRef(branch), commitSha);
+  repo.updatedAt = isoNow();
+  repo.pushedAt = repo.updatedAt;
   return { commitSha, blobSha, oldSha };
 }
 
@@ -254,80 +185,29 @@ export function upsertFile(repo: RepoData, branch: string, path: string, content
 export function deleteFile(repo: RepoData, branch: string, path: string, message: string): { commitSha: string } | null {
   const tip = branchTip(repo, branch);
   if (tip === null) return null;
-  const snapshot = new Map(repo.commits.get(tip)!.snapshot);
-  const existing = snapshot.get(path);
-  if (existing === undefined) return null;
-  snapshot.delete(path);
-  const commitSha = createCommit(repo, snapshot, [tip], message);
+  const baseTree = S.parseCommitObj(repo.objects.get(tip)!.data).tree;
+  if (S.treeGet(repo.objects, baseTree, path) === null) return null;
+  const newTree = S.upsertTreePath(repo.objects, baseTree, path.split('/').filter((s) => s.length > 0), null);
+  const who = { name: ownerLogin(), email: `${ownerLogin()}@makefun.local` };
+  const line = S.authorLine(who.name, who.email, Math.floor(Date.now() / 1000));
+  const commitData = S.buildCommitObj(newTree, [tip], line, line, message.endsWith('\n') ? message : `${message}\n`);
+  const commitSha = S.storeObj(repo.objects, 'commit', commitData);
   repo.refs.set(headRef(branch), commitSha);
+  repo.updatedAt = isoNow();
+  repo.pushedAt = repo.updatedAt;
   return { commitSha };
 }
 
-function mergeBaseOf(repo: RepoData, a: string, b: string): string | null {
-  const ancestors = new Set<string>();
-  const queue = [a];
-  while (queue.length > 0) {
-    const sha = queue.shift()!;
-    if (ancestors.has(sha)) continue;
-    ancestors.add(sha);
-    for (const parent of repo.commits.get(sha)?.parents ?? []) queue.push(parent);
-  }
-  const seen = new Set<string>();
-  const second = [b];
-  while (second.length > 0) {
-    const sha = second.shift()!;
-    if (seen.has(sha)) continue;
-    seen.add(sha);
-    if (ancestors.has(sha)) return sha;
-    for (const parent of repo.commits.get(sha)?.parents ?? []) second.push(parent);
-  }
-  return null;
-}
-
 /**
- * Squash-merge `head` into `base`: one commit on `base` carrying head's tree. 'conflict' when both
- * sides changed the same path differently (the base ref is then left untouched).
+ * Squash-merge `head` into `base`: one commit on `base` carrying the merged tree. 'conflict' when
+ * both sides changed the same path differently (the base ref is then left untouched).
  */
 export function squashMerge(repo: RepoData, head: string, base: string, message: string): { sha: string } | 'conflict' {
   const headTip = branchTip(repo, head);
   const baseTip = branchTip(repo, base);
   if (headTip === null || baseTip === null) return 'conflict';
   if (headTip === baseTip) return { sha: baseTip };
-  const mergeBaseSha = mergeBaseOf(repo, baseTip, headTip);
-  const headCommit = repo.commits.get(headTip)!;
-  if (mergeBaseSha === baseTip) {
-    // the base branch has not moved since the branch point: head's tree merges cleanly
-    const sha = createCommit(repo, new Map(headCommit.snapshot), [baseTip], message);
-    repo.refs.set(headRef(base), sha);
-    return { sha };
-  }
-  if (mergeBaseSha === null) return 'conflict';
-  const baseCommit = repo.commits.get(baseTip)!;
-  const mergeSnapshot = repo.commits.get(mergeBaseSha)!.snapshot;
-  const baseSnapshot = baseCommit.snapshot;
-  const headSnapshot = headCommit.snapshot;
-  const paths = new Set<string>([...mergeSnapshot.keys(), ...baseSnapshot.keys(), ...headSnapshot.keys()]);
-  const merged = new Map(baseSnapshot);
-  let conflict = false;
-  for (const path of paths) {
-    const original = mergeSnapshot.get(path) ?? null;
-    const onBase = baseSnapshot.get(path) ?? null;
-    const onHead = headSnapshot.get(path) ?? null;
-    const headChanged = (original?.sha ?? null) !== (onHead?.sha ?? null);
-    const baseChanged = (original?.sha ?? null) !== (onBase?.sha ?? null);
-    if (!headChanged) continue;                    // base keeps its version
-    if (!baseChanged) {                            // head's change applies cleanly
-      if (onHead === null) merged.delete(path);
-      else merged.set(path, onHead);
-      continue;
-    }
-    if ((onBase?.sha ?? null) === (onHead?.sha ?? null)) continue; // both made the same change
-    conflict = true;
-  }
-  if (conflict) return 'conflict';
-  const sha = createCommit(repo, merged, [baseTip], message);
-  repo.refs.set(headRef(base), sha);
-  return { sha };
+  return forge.squashMerge(repo, head, base, message);
 }
 
 function lineDiff(oldData: Buffer, newData: Buffer): { additions: number; deletions: number } {
@@ -354,17 +234,19 @@ function lineDiff(oldData: Buffer, newData: Buffer): { additions: number; deleti
 
 /** The two-dot diff between two branches (what GET /pulls/{n}/files answers). */
 export function diffFiles(repo: RepoData, base: string, head: string): DiffFile[] {
-  const baseSnapshot = snapshotOf(repo, base);
-  const headSnapshot = snapshotOf(repo, head);
-  if (baseSnapshot === null || headSnapshot === null) return [];
-  const paths = new Set<string>([...baseSnapshot.keys(), ...headSnapshot.keys()]);
+  const baseTree = tipTree(repo, base);
+  const headTree = tipTree(repo, head);
+  if (baseTree === null || headTree === null) return [];
+  const baseFlat = S.flattenTree(repo.objects, baseTree);
+  const headFlat = S.flattenTree(repo.objects, headTree);
+  const paths = new Set<string>([...baseFlat.keys(), ...headFlat.keys()]);
   const files: DiffFile[] = [];
   for (const path of [...paths].sort()) {
-    const onBase = baseSnapshot.get(path) ?? null;
-    const onHead = headSnapshot.get(path) ?? null;
+    const onBase = baseFlat.get(path) ?? null;
+    const onHead = headFlat.get(path) ?? null;
     if ((onBase?.sha ?? null) === (onHead?.sha ?? null)) continue;
     const status: DiffFile['status'] = onBase === null ? 'added' : onHead === null ? 'removed' : 'modified';
-    const { additions, deletions } = lineDiff(onBase?.data ?? Buffer.alloc(0), onHead?.data ?? Buffer.alloc(0));
+    const { additions, deletions } = lineDiff(onBase === null ? Buffer.alloc(0) : blobData(repo, onBase.sha), onHead === null ? Buffer.alloc(0) : blobData(repo, onHead.sha));
     const add = additions + deletions === 0 && status !== 'removed' ? 1 : additions;
     files.push({ filename: path, status, additions: add, deletions, changes: add + deletions, sha: (onHead ?? onBase)!.sha });
   }
@@ -581,14 +463,19 @@ export function commentJson(repo: RepoData, issue: Issue, comment: Comment): Jso
 }
 
 export function commitJson(info: CommitInfo): Json {
+  const treeSha = info.tree ?? info.sha;
   return {
     sha: info.sha,
-    message: info.message,
-    author: { name: info.author.name, email: info.author.email, date: info.author.when },
-    committer: { name: info.author.name, email: info.author.email, date: info.author.when },
-    tree: { sha: info.sha },
-    parents: info.parents.map((sha) => ({ sha, url: `/api/v3/repos/-/commits/${sha}` })),
+    node_id: `Commit:${info.sha}`,
+    commit: {
+      message: info.message,
+      author: { name: info.author.name, email: info.author.email, date: info.author.when },
+      committer: { name: info.author.name, email: info.author.email, date: info.author.when },
+      tree: { sha: treeSha },
+      url: `/api/v3/repos/-/git/commits/${info.sha}`,
+    },
     verification: { verified: false, reason: 'unsigned', signature: null, payload: null },
+    parents: info.parents.map((sha) => ({ sha, url: `/api/v3/repos/-/commits/${sha}` })),
     html_url: `https://git.makefun.local/-/commit/${info.sha}`,
     url: `/api/v3/repos/-/commits/${info.sha}`,
   };
