@@ -62,28 +62,37 @@ import {
   type Pull,
   type RepoData,
 } from './apimock-store.ts';
-import { intParam, isAuthorized, isRecord, readBody, safeDecode, sendError, sendJson, sendNoContent } from './http-util.ts';
+import { intParam, isAuthorized, isRecord, mayHaveBody, readBody, safeDecode, sendError, sendJson, sendNoContent } from './http-util.ts';
 
 const API_PREFIX = '/api/v3';
+
+/** Shared empty query (URLSearchParams.get on it returns null, exactly like an absent query). */
+const EMPTY_QUERY = new URLSearchParams();
 
 /** The REST entry point. Dispatches one /api/v3 request; every reply is JSON. */
 export async function handleRest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
-    const url = new URL(req.url ?? '/', 'http://entry.local');
-    const path = url.pathname;
+    // Manual URL split (pathname + raw query) — a full `new URL` parse per request is one of the
+    // hottest fixed costs under the trial's CPU budget, and every hot route here is query-less.
+    const rawUrl = req.url ?? '/';
+    const qIndex = rawUrl.indexOf('?');
+    const path = qIndex < 0 ? rawUrl : rawUrl.slice(0, qIndex);
     if (!isAuthorized(req)) {
       sendError(res, 401, 'Requires authentication');
       return;
     }
-    let raw: Buffer;
-    try {
-      raw = await readBody(req);
-    } catch {
-      sendError(res, 413, 'Request body too large');
-      return;
+    const method = (req.method ?? 'GET').toUpperCase();
+    let raw: Buffer | null = null;
+    if (mayHaveBody(req, method)) {
+      try {
+        raw = await readBody(req);
+      } catch {
+        sendError(res, 413, 'Request body too large');
+        return;
+      }
     }
     let body: unknown = undefined;
-    if (raw.length > 0) {
+    if (raw !== null && raw.length > 0) {
       try {
         body = JSON.parse(raw.toString('utf8'));
       } catch {
@@ -91,7 +100,6 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse): Pro
         return;
       }
     }
-    const method = (req.method ?? 'GET').toUpperCase();
     let tail: string;
     if (path === API_PREFIX || path === `${API_PREFIX}/`) tail = '';
     else if (path.startsWith(`${API_PREFIX}/`)) tail = path.slice(API_PREFIX.length + 1);
@@ -100,7 +108,8 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse): Pro
       return;
     }
     const parts = tail === '' ? [] : tail.split('/').map(safeDecode);
-    dispatch(req, res, parts, method, url.searchParams, body);
+    const query = qIndex < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(qIndex + 1));
+    dispatch(req, res, parts, method, query, body);
   } catch (error) {
     sendError(res, 500, `Internal Server Error: ${error instanceof Error ? error.message : String(error)}`);
   }

@@ -1,12 +1,25 @@
 // Shared HTTP plumbing for the three API surfaces (REST v3, GraphQL v4, MCP).
 // Node 22 standard library only.
 
-import { randomBytes } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-/** A random, non-empty X-GitHub-Request-Id value (unique per call). */
+// Counter-based ids: unique per process, and — unlike randomBytes/randomUUID — no getrandom
+// syscall per response (that syscall is the dominant fixed cost of a reply under gVisor).
+let requestSeq = 0;
+const requestPid = process.pid.toString(36);
+
+/** A unique X-GitHub-Request-Id value (unique per call). */
 export function requestId(): string {
-  return randomBytes(8).toString('hex');
+  requestSeq += 1;
+  return `${requestPid}${requestSeq.toString(36)}`;
+}
+
+/** Whether the request can carry a body (methods that always may, or framing that says so). */
+export function mayHaveBody(req: IncomingMessage, method: string): boolean {
+  if (method !== 'GET' && method !== 'HEAD') return true;
+  const length = req.headers['content-length'];
+  if (length !== undefined && length !== '0') return true;
+  return req.headers['transfer-encoding'] !== undefined;
 }
 
 /** The suite's bearer token, injected by main.ts through the environment. */

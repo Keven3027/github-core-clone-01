@@ -132,6 +132,8 @@ function v2Advertisement(): Buffer {
     S.FLUSH,
   ]);
 }
+// The v2 capability advertisement is repo-independent and constant: build it once.
+const V2_ADVERTISEMENT = v2Advertisement();
 
 // ---------------------------------------------------------------------------------------------
 // upload-pack v2 commands
@@ -490,8 +492,8 @@ function gitProtocolVersion(req: IncomingMessage): number {
   return 0;
 }
 
-async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
-  const parsed = parseRoute(url.pathname);
+async function route(req: IncomingMessage, res: ServerResponse, pathname: string, rawQuery: string): Promise<void> {
+  const parsed = parseRoute(pathname);
   if (!parsed) {
     sendJson(res, 404, { message: 'Not Found' });
     return;
@@ -521,13 +523,13 @@ async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promi
       sendJson(res, 405, { message: 'Method Not Allowed' });
       return;
     }
-    const service = url.searchParams.get('service') ?? '';
+    const service = new URLSearchParams(rawQuery).get('service') ?? '';
     if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
       sendJson(res, 404, { message: 'Not Found' });
       return;
     }
     const v2 = service === 'git-upload-pack' && gitProtocolVersion(req) === 2;
-    const body = v2 ? v2Advertisement() : v0Advertisement(repo, service);
+    const body = v2 ? V2_ADVERTISEMENT : v0Advertisement(repo, service);
     sendRaw(res, 200, `application/x-${service}-advertisement`, body);
     return;
   }
@@ -562,15 +564,12 @@ async function route(req: IncomingMessage, res: ServerResponse, url: URL): Promi
  * caller can fall through; answers the request itself otherwise (never throws).
  */
 export async function handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  let pathname = '/';
-  try {
-    pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
-  } catch {
-    pathname = '/';
-  }
+  const rawUrl = req.url ?? '/';
+  const qIndex = rawUrl.indexOf('?');
+  const pathname = qIndex < 0 ? rawUrl : rawUrl.slice(0, qIndex);
   if (!isGitRoute(pathname)) return false;
   try {
-    await route(req, res, new URL(req.url ?? '/', 'http://localhost'));
+    await route(req, res, pathname, qIndex < 0 ? '' : rawUrl.slice(qIndex + 1));
   } catch (err) {
     if (!res.headersSent) sendJson(res, 500, { message: 'Internal Server Error' });
     else res.end();

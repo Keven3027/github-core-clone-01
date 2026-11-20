@@ -3,11 +3,11 @@
 // starter shipped it. Handlers: src/git-http.ts, src/rest.ts, src/graphql.ts, src/mcp.ts.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { randomUUID } from 'node:crypto';
 import { isGitRoute, handle as handleGit } from './src/git-http.ts';
 import { handleRest } from './src/rest.ts';
 import { handleGraphQL } from './src/graphql.ts';
 import { handleMCP } from './src/mcp.ts';
+import { requestId } from './src/http-util.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -17,7 +17,7 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, hea
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': Buffer.byteLength(text),
-    'x-github-request-id': randomUUID(),
+    'x-github-request-id': requestId(),
     ...headers,
   });
   res.end(text);
@@ -25,15 +25,14 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, hea
 
 /** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
 export function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+  const url = req.url ?? '/';
+  const cut = url.indexOf('?');
+  const path = cut < 0 ? url : url.slice(0, cut);
+  return path.length > 0 && path.charCodeAt(0) === 0x2f ? path : '/';
 }
 
 export function createApp(): Server {
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const path = pathOf(req);
     const method = req.method ?? 'GET';
 
@@ -76,4 +75,8 @@ export function createApp(): Server {
     // Everything else, every method: GitHub's 404 body — JSON, never HTML.
     sendJson(res, 404, { message: 'Not Found' });
   });
+  // No Nagle: the suite drives sequential request/response pairs on keep-alive connections,
+  // where delayed small-packet coalescing adds a round trip to every reply.
+  server.on('connection', (socket) => socket.setNoDelay(true));
+  return server;
 }
